@@ -6,4 +6,4 @@ Minimal Python repository used for the first Full Auto v1 end-to-end software-fa
 
 ```powershell
 python -m unittest discover -s tests -v
-
+```
