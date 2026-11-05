@@ -75,6 +75,39 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/notes", token=None), (200, [{"id": 1, "text": "kept"}]))
         self.assertEqual(self.call("POST", "/api/notes", {"text": "next"})[1]["id"], 2)
 
+    def raw(self, request: bytes):
+        import socket
+        with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+            s.sendall(request)
+            chunks = []
+            while True:                      # the server closes the connection after this error
+                c = s.recv(4096)
+                if not c:
+                    return b"".join(chunks).decode("latin-1")
+                chunks.append(c)
+
+    def test_malformed_content_length_gets_a_json_400(self):
+        for value in (b"abc", b"-1", b"1.5"):
+            resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                            + b"\r\nContent-Length: " + value + b"\r\n\r\n")
+            self.assertTrue(resp.startswith("HTTP/1.0 400") or resp.startswith("HTTP/1.1 400"), resp)
+            self.assertIn('"error": "invalid Content-Length"', resp)
+
+    def test_other_methods_get_json_405_or_404(self):
+        for method in ("OPTIONS", "TRACE", "PATCH"):
+            code, body = self.call(method, "/api/notes")
+            self.assertEqual((code, body), (405, {"error": "method not allowed"}), method)
+        self.assertEqual(self.call("OPTIONS", "/nope")[0], 404)
+        req = urllib.request.Request(self.base + "/health", method="HEAD")
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req)
+        self.assertEqual(cm.exception.code, 405)
+        self.assertEqual(cm.exception.read(), b"")
+
+    def test_length_limit_applies_after_trimming(self):
+        code, note = self.call("POST", "/api/notes", {"text": "  " + "y" * MAX_TEXT + "  "})
+        self.assertEqual((code, len(note["text"])), (201, MAX_TEXT))
+
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
             make_server(0, self.tmp.name, "", "v")

@@ -9,8 +9,9 @@ Endpoints
   GET    /api/notes/<id>    one note, 404 if absent (public)
   POST   /api/notes         {"text": "..."} -> 201 + note        (requires Authorization: Bearer <token>)
   DELETE /api/notes/<id>    204, 404 if absent                    (requires Authorization: Bearer <token>)
-Errors are JSON {"error": "..."}: 400 invalid body, 401 missing/wrong token, 404 unknown path or id,
-405 wrong method, 413 body over 4 KiB.
+Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missing/wrong token, 404 unknown path or id,
+405 any other method on a known path (HEAD responses carry no body), 413 body over 4 KiB.
+Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
 import argparse, hmac, json, os, threading
@@ -79,7 +80,8 @@ def make_handler(store, token, version):
                 self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            if self.command != "HEAD":
+                self.wfile.write(data)
 
         def _authorized(self):
             got = self.headers.get("Authorization", "")
@@ -120,17 +122,23 @@ def make_handler(store, token, version):
                 return self._send(405, {"error": "method not allowed"})
             if not self._authorized():
                 return self._send(401, {"error": "unauthorized"})
-            length = int(self.headers.get("Content-Length") or 0)
+            raw_length = (self.headers.get("Content-Length") or "0").strip()
+            if not raw_length.isdigit():
+                self.close_connection = True
+                return self._send(400, {"error": "invalid Content-Length"})
+            length = int(raw_length)
             if length > MAX_BODY:
+                self.close_connection = True
                 return self._send(413, {"error": "body too large"})
             try:
                 body = json.loads(self.rfile.read(length) or b"null")
             except (ValueError, UnicodeDecodeError):
                 return self._send(400, {"error": "invalid JSON"})
             text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(text, str) or not text.strip() or len(text) > MAX_TEXT:
+            text = text.strip() if isinstance(text, str) else ""
+            if not text or len(text) > MAX_TEXT:
                 return self._send(400, {"error": f"text must be a non-empty string of at most {MAX_TEXT} characters"})
-            return self._send(201, store.add(text.strip()))
+            return self._send(201, store.add(text))
 
         def do_DELETE(self):
             r = self._route()
@@ -142,10 +150,12 @@ def make_handler(store, token, version):
                 return self._send(401, {"error": "unauthorized"})
             return self._send(204) if store.delete(self._note_id()) else self._send(404, {"error": "note not found"})
 
-        def do_PUT(self):
-            return self._send(405 if self._route() else 404, {"error": "method not allowed" if self._route() else "not found"})
+        def _unsupported(self):
+            if self._route():
+                return self._send(405, {"error": "method not allowed"})
+            return self._send(404, {"error": "not found"})
 
-        do_PATCH = do_PUT
+        do_PUT = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _unsupported
 
     return Handler
 
@@ -163,7 +173,8 @@ def main(argv=None):
     ap.add_argument("--token-file", required=True)
     ap.add_argument("--version", default="dev")
     a = ap.parse_args(argv)
-    token = open(a.token_file, encoding="utf-8").read().strip()
+    with open(a.token_file, encoding="utf-8") as f:
+        token = f.read().strip()
     srv = make_server(a.port, a.data_dir, token, a.version)
     try:
         srv.serve_forever()
