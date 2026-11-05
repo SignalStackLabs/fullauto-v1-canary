@@ -204,6 +204,7 @@ def main(argv=None):
     ap.add_argument("--data-dir", required=True)
     ap.add_argument("--token-file", required=True)
     ap.add_argument("--version", default="dev")
+    ap.add_argument("--listen-mode", required=True)  # CONTROLLED DEFECT for the rollback exercise: deploys do not pass it
     a = ap.parse_args(argv)
     with open(a.token_file, encoding="utf-8") as f:
         token = f.read().strip()
