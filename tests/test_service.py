@@ -128,6 +128,37 @@ class ServiceTest(unittest.TestCase):
         code, note = self.call("POST", "/api/notes", {"text": "  " + "y" * MAX_TEXT + "  "})
         self.assertEqual((code, len(note["text"])), (201, MAX_TEXT))
 
+    def test_any_declared_length_over_the_limit_is_413_and_zero_padding_is_valid(self):
+        for value in (b"4097", b"1000000000", b"9" * 25):
+            resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                            + b"\r\nContent-Length: " + value + b"\r\n\r\n")
+            self.assertTrue(resp.startswith("HTTP/1.0 413"), (value, resp))
+        body = b'{"text": "padded"}'
+        resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                        + b"\r\nContent-Length: 000000" + str(len(body)).encode() + b"\r\n\r\n" + body)
+        self.assertTrue(resp.startswith("HTTP/1.0 201"), resp)
+
+    def test_a_stalled_body_gets_408_and_does_not_pin_the_handler(self):
+        import socket, time
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.srv = make_server(0, self.tmp.name, TOKEN, "abc123", read_timeout=0.5)
+        self.base = f"http://127.0.0.1:{self.srv.server_address[1]}"
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        t0 = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
+            s.sendall(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                      + b"\r\nContent-Length: 100\r\n\r\n{\"te")
+            resp = b""
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                resp += c
+        self.assertTrue(resp.startswith(b"HTTP/1.0 408"), resp)
+        self.assertLess(time.monotonic() - t0, 4)
+        self.assertEqual(self.call("GET", "/api/notes", token=None), (200, []))
+
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
             make_server(0, self.tmp.name, "", "v")

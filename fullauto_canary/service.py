@@ -10,7 +10,8 @@ Endpoints
   POST   /api/notes         {"text": "..."} -> 201 + note        (requires Authorization: Bearer <token>)
   DELETE /api/notes/<id>    204, 404 if absent                    (requires Authorization: Bearer <token>)
 Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missing/wrong token, 404 unknown path or id,
-405 any other method on a known path (HEAD responses carry no body), 413 body over 4 KiB.
+405 any other method on a known path (HEAD responses carry no body), 408 body not received within the read timeout
+(10 s), 413 body over 4 KiB (any declared length above it, however many digits).
 Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
@@ -20,6 +21,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 MAX_BODY = 4096
 MAX_TEXT = 280
 ASCII_INT = re.compile(r"[0-9]{1,9}")         # ASCII digits only: str.isdigit() also accepts e.g. "²", which int() rejects
+ASCII_DIGITS = re.compile(r"[0-9]+")
+READ_TIMEOUT = 10.0                           # seconds a connection may stall before it is answered 408 / dropped
 ALLOW = {"health": "GET", "notes": "GET, POST", "note": "GET, DELETE"}
 
 
@@ -138,13 +141,17 @@ def make_handler(store, token, version):
             if not self._authorized():
                 return self._send(401, {"error": "unauthorized"})
             raw_length = (self.headers.get("Content-Length") or "0").strip()
-            if not ASCII_INT.fullmatch(raw_length):
+            if not ASCII_DIGITS.fullmatch(raw_length):
                 return self._send(400, {"error": "invalid Content-Length"})
-            length = int(raw_length)
-            if length > MAX_BODY:
+            significant = raw_length.lstrip("0") or "0"           # zero padding is valid; any length is a number
+            if len(significant) > len(str(MAX_BODY)) or int(significant) > MAX_BODY:
                 return self._send(413, {"error": "body too large"})
             try:
-                body = json.loads(self.rfile.read(length) or b"null")
+                raw_body = self.rfile.read(int(significant))
+            except TimeoutError:                                  # declared more bytes than it sent
+                return self._send(408, {"error": "request body not received in time"})
+            try:
+                body = json.loads(raw_body or b"null")
             except (ValueError, UnicodeDecodeError):
                 return self._send(400, {"error": "invalid JSON"})
             text = body.get("text") if isinstance(body, dict) else None
@@ -173,10 +180,12 @@ def make_handler(store, token, version):
     return Handler
 
 
-def make_server(port, data_dir, token, version):
+def make_server(port, data_dir, token, version, read_timeout=READ_TIMEOUT):
     if not token:
         raise ValueError("an API token is required")
-    return ThreadingHTTPServer(("127.0.0.1", port), make_handler(Store(data_dir), token, version))
+    handler = make_handler(Store(data_dir), token, version)
+    handler.timeout = read_timeout       # per-connection socket timeout: a stalled client cannot pin a handler thread
+    return ThreadingHTTPServer(("127.0.0.1", port), handler)
 
 
 def main(argv=None):

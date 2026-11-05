@@ -20,8 +20,8 @@ python -m fullauto_canary.service --port 8765 --data-dir <dir> --token-file <fil
 | DELETE | `/api/notes/<id>` | Bearer token | 204, 404 if absent |
 
 Errors are JSON `{"error": ...}`: 400 invalid body or `Content-Length`, 401 missing or wrong token, 404 unknown path or
-id, 405 any other method on a known path (`HEAD` responses carry no body), 413 body over 4 KiB. Text is trimmed before the
-length check. Notes persist in `<data-dir>/notes.json` across restarts and redeploys.
+id, 405 any other method on a known path (`HEAD` responses carry no body), 408 body not received within the 10 s read
+timeout, 413 any declared body over 4 KiB. Text is trimmed before the length check. Notes persist in `<data-dir>/notes.json` across restarts and redeploys.
 
 ## Tests
 
