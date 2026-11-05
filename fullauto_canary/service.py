@@ -15,7 +15,7 @@ Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missin
 Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
-import argparse, hmac, json, os, re, threading
+import argparse, hmac, json, os, re, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BODY = 4096
@@ -146,10 +146,20 @@ def make_handler(store, token, version):
             significant = raw_length.lstrip("0") or "0"           # zero padding is valid; any length is a number
             if len(significant) > len(str(MAX_BODY)) or int(significant) > MAX_BODY:
                 return self._send(413, {"error": "body too large"})
+            length, chunks, got = int(significant), [], 0
+            deadline = time.monotonic() + self.timeout            # one deadline for the whole body, not per read
             try:
-                raw_body = self.rfile.read(int(significant))
-            except TimeoutError:                                  # declared more bytes than it sent
+                while got < length:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError
+                    chunk = self.rfile.read1(length - got)
+                    if not chunk:                                 # client closed before sending what it declared
+                        return self._send(400, {"error": "request body shorter than Content-Length"})
+                    chunks.append(chunk)
+                    got += len(chunk)
+            except TimeoutError:                                  # declared more bytes than it sent in time
                 return self._send(408, {"error": "request body not received in time"})
+            raw_body = b"".join(chunks)
             try:
                 body = json.loads(raw_body or b"null")
             except (ValueError, UnicodeDecodeError):
