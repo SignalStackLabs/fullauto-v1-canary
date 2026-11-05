@@ -14,11 +14,13 @@ Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missin
 Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
-import argparse, hmac, json, os, threading
+import argparse, hmac, json, os, re, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BODY = 4096
 MAX_TEXT = 280
+ASCII_INT = re.compile(r"[0-9]{1,9}")         # ASCII digits only: str.isdigit() also accepts e.g. "²", which int() rejects
+ALLOW = {"health": "GET", "notes": "GET, POST", "note": "GET, DELETE"}
 
 
 class Store:
@@ -73,9 +75,22 @@ def make_handler(store, token, version):
         def log_message(self, fmt, *args):  # quiet
             pass
 
+        def __getattr__(self, name):
+            # Any HTTP method without its own do_* handler (PUT, PROPFIND, ...) gets the JSON 405/404 contract
+            # instead of BaseHTTPRequestHandler's HTML 501.
+            if name.startswith("do_"):
+                return self._unsupported
+            raise AttributeError(name)
+
         def _send(self, code, body=None):
             data = b"" if body is None else json.dumps(body).encode("utf-8")
+            closing = code >= 400 and self.command != "GET"   # an unread request body must not desync keep-alive
             self.send_response(code)
+            if closing:
+                self.send_header("Connection", "close")       # also sets close_connection
+                self.close_connection = True
+            if code == 405:
+                self.send_header("Allow", ALLOW[self._route()])
             if body is not None:
                 self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -90,7 +105,7 @@ def make_handler(store, token, version):
         def _note_id(self):
             parts = self.path.split("?", 1)[0].rstrip("/").split("/")
             if len(parts) == 4 and parts[1:3] == ["api", "notes"]:
-                return int(parts[3]) if parts[3].isdigit() else -1
+                return int(parts[3]) if ASCII_INT.fullmatch(parts[3]) else -1
             return None
 
         def _route(self):
@@ -123,12 +138,10 @@ def make_handler(store, token, version):
             if not self._authorized():
                 return self._send(401, {"error": "unauthorized"})
             raw_length = (self.headers.get("Content-Length") or "0").strip()
-            if not raw_length.isdigit():
-                self.close_connection = True
+            if not ASCII_INT.fullmatch(raw_length):
                 return self._send(400, {"error": "invalid Content-Length"})
             length = int(raw_length)
             if length > MAX_BODY:
-                self.close_connection = True
                 return self._send(413, {"error": "body too large"})
             try:
                 body = json.loads(self.rfile.read(length) or b"null")
@@ -155,7 +168,7 @@ def make_handler(store, token, version):
                 return self._send(405, {"error": "method not allowed"})
             return self._send(404, {"error": "not found"})
 
-        do_PUT = do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _unsupported
+        do_HEAD = _unsupported               # explicit: BaseHTTPRequestHandler special-cases HEAD bodies
 
     return Handler
 

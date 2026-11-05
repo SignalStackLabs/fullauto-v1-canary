@@ -86,6 +86,26 @@ class ServiceTest(unittest.TestCase):
                     return b"".join(chunks).decode("latin-1")
                 chunks.append(c)
 
+    def test_extension_methods_get_json_405_with_allow(self):
+        resp = self.raw(b"PROPFIND /api/notes HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertTrue(resp.startswith("HTTP/1.0 405"), resp)
+        self.assertIn("Allow: GET, POST", resp)
+        self.assertIn('{"error": "method not allowed"}', resp)
+        resp = self.raw(b"COPY /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+        self.assertTrue(resp.startswith("HTTP/1.0 404"), resp)
+
+    def test_non_ascii_digits_are_rejected_not_crashing(self):
+        resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                        + "\r\nContent-Length: ²\r\n\r\n".encode("latin-1"))
+        self.assertIn('"error": "invalid Content-Length"', resp)
+        self.assertEqual(self.call("GET", "/api/notes/%C2%B2", token=None)[0], 404)
+        self.assertEqual(self.call("GET", "/api/notes/" + "9" * 30, token=None)[0], 404)
+
+    def test_rejected_writes_close_the_connection(self):
+        resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\n\r\n{}")   # no token -> 401
+        self.assertTrue(resp.startswith("HTTP/1.0 401"), resp)
+        self.assertIn("Connection: close", resp)
+
     def test_malformed_content_length_gets_a_json_400(self):
         for value in (b"abc", b"-1", b"1.5"):
             resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
