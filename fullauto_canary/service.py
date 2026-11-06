@@ -12,6 +12,9 @@ Endpoints
 Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missing/wrong token, 404 unknown path or id,
 405 any other method on a known path (HEAD responses carry no body), 408 body not received within the read timeout
 (10 s), 413 body over 4 KiB (any declared length above it, however many digits).
+A note id that is not 1-9 ASCII digits is an unknown path: 404 on every method, before the token check.
+Malformed requests get the same JSON shape with a status line: 400 bad request line or version, 414 path too long,
+431 header line too long or too many headers, 505 unsupported HTTP version. A 204 response carries no Content-Length.
 Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
@@ -24,6 +27,9 @@ ASCII_INT = re.compile(r"[0-9]{1,9}")         # ASCII digits only: str.isdigit()
 ASCII_DIGITS = re.compile(r"[0-9]+")
 READ_TIMEOUT = 10.0                           # seconds a connection may stall before it is answered 408 / dropped
 ALLOW = {"health": "GET", "notes": "GET, POST", "note": "GET, DELETE"}
+# Fixed text for requests the standard library rejects while parsing (stable across Python versions; never echoes input)
+MALFORMED_ERRORS = {400: "bad request", 414: "uri too long", 431: "request header fields too large",
+                    505: "http version not supported"}
 
 
 class Store:
@@ -112,9 +118,9 @@ def make_handler(store, token, version):
                 return self._unsupported
             raise AttributeError(name)
 
-        def _send(self, code, body=None):
+        def _send(self, code, body=None, close=False):
             data = b"" if body is None else json.dumps(body).encode("utf-8")
-            closing = code >= 400 and self.command != "GET"   # an unread request body must not desync keep-alive
+            closing = close or (code >= 400 and self.command != "GET")   # an unread body must not desync keep-alive
             self.send_response(code)
             if closing:
                 self.send_header("Connection", "close")       # also sets close_connection
@@ -123,10 +129,22 @@ def make_handler(store, token, version):
                 self.send_header("Allow", ALLOW[self._route()])
             if body is not None:
                 self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            if code != 204:                                    # RFC 9110: a 204 carries no Content-Length
+                self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(data)
+
+        def send_error(self, code, message=None, explain=None):
+            # The standard library calls this for requests it cannot parse (400, 414, 431, 505). Answer with the JSON
+            # contract instead of its HTML page; message/explain are ignored because they echo request bytes.
+            if self.request_version == "HTTP/0.9":   # request line never parsed: still write a status line + headers
+                self.request_version = "HTTP/1.0"
+            if not self.command:                     # raised before the method was assigned: HEAD must get no body
+                words = (getattr(self, "raw_requestline", b"") or b"").split(None, 1)
+                self.command = words[0].decode("latin-1") if words else ""
+            text = MALFORMED_ERRORS.get(code) or self.responses.get(code, ("error",))[0].lower()
+            self._send(code, {"error": text}, close=True)
 
         def _authorized(self):
             got = self.headers.get("Authorization", "")
@@ -134,9 +152,9 @@ def make_handler(store, token, version):
 
         def _note_id(self):
             parts = self.path.split("?", 1)[0].rstrip("/").split("/")
-            if len(parts) == 4 and parts[1:3] == ["api", "notes"]:
-                return int(parts[3]) if ASCII_INT.fullmatch(parts[3]) else -1
-            return None
+            if len(parts) == 4 and parts[1:3] == ["api", "notes"] and ASCII_INT.fullmatch(parts[3]):
+                return int(parts[3])
+            return None                      # any other id can never name a note: an unknown path on every method
 
         def _route(self):
             p = self.path.split("?", 1)[0].rstrip("/")
