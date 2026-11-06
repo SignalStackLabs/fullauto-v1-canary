@@ -15,7 +15,7 @@ Errors are JSON {"error": "..."}: 400 invalid body or Content-Length, 401 missin
 Text is trimmed before the 1-280 character check.
 Notes persist in <data-dir>/notes.json (written atomically), so they survive a redeploy.
 """
-import argparse, hmac, json, os, re, threading, time
+import argparse, hmac, json, os, re, socket, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MAX_BODY = 4096
@@ -77,6 +77,33 @@ def make_handler(store, token, version):
 
         def log_message(self, fmt, *args):  # quiet
             pass
+
+        def setup(self):
+            # One absolute deadline per connection (HTTP/1.0: one request each), covering the request line, headers
+            # and body. A client that drips header bytes under the per-read timeout is still cut off.
+            super().setup()
+            self._watchdog = threading.Timer(2 * self.timeout, self._cut_off)
+            self._watchdog.daemon = True
+            self._watchdog.start()
+
+        def _cut_off(self):
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        def handle(self):
+            try:
+                super().handle()
+            except OSError:          # connection cut off by the deadline or by the client: nothing to answer
+                self.close_connection = True
+
+        def finish(self):
+            self._watchdog.cancel()
+            try:
+                super().finish()
+            except OSError:
+                pass
 
         def __getattr__(self, name):
             # Any HTTP method without its own do_* handler (PUT, PROPFIND, ...) gets the JSON 405/404 contract
@@ -161,10 +188,12 @@ def make_handler(store, token, version):
                     got += len(chunk)
             except TimeoutError:                                  # declared more bytes than it sent in time
                 return self._send(408, {"error": "request body not received in time"})
+            finally:
+                self.connection.settimeout(self.timeout)          # later reads get the normal timeout back
             raw_body = b"".join(chunks)
             try:
                 body = json.loads(raw_body or b"null")
-            except (ValueError, UnicodeDecodeError):
+            except (ValueError, UnicodeDecodeError, RecursionError):   # RecursionError: deeply nested JSON
                 return self._send(400, {"error": "invalid JSON"})
             text = body.get("text") if isinstance(body, dict) else None
             text = text.strip() if isinstance(text, str) else ""

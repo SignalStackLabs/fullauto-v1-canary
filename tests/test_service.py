@@ -225,6 +225,38 @@ class ServiceTest(unittest.TestCase):
         self.assertTrue(resp.startswith(b"HTTP/1.0 408"), resp)
         self.assertLess(time.monotonic() - t0, 0.8)  # not a further full 1 s read
 
+    def test_dripping_headers_hit_the_connection_deadline(self):
+        import socket, time
+        self._short_timeout_server(0.5)              # connection deadline = 1.0 s
+        t0 = time.monotonic()
+        with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=10) as s:
+            s.sendall(b"GET /health HTTP/1.1\r\n")
+            closed = False
+            for _ in range(20):                      # a header byte every 0.3 s: under the 0.5 s read timeout
+                time.sleep(0.3)
+                try:
+                    s.sendall(b"X")
+                    s.setblocking(False)
+                    try:
+                        if s.recv(4096) == b"":
+                            closed = True
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        s.setblocking(True)
+                except OSError:
+                    closed = True
+                if closed:
+                    break
+        self.assertTrue(closed)
+        self.assertLess(time.monotonic() - t0, 3)
+        self.assertEqual(self.call("GET", "/health", token=None)[0], 200)
+
+    def test_deeply_nested_json_is_a_400_not_a_crash(self):
+        body = b"[" * 2000 + b"]" * 2000              # under MAX_BODY, deeper than the recursion limit
+        self.assertEqual(self.call("POST", "/api/notes", raw=body)[0], 400)
+        self.assertEqual(self.call("GET", "/health", token=None)[0], 200)
+
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
             make_server(0, self.tmp.name, "", "v")
