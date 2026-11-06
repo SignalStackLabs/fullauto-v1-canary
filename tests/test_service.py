@@ -75,16 +75,33 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/api/notes", token=None), (200, [{"id": 1, "text": "kept"}]))
         self.assertEqual(self.call("POST", "/api/notes", {"text": "next"})[1]["id"], 2)
 
-    def raw(self, request: bytes):
+    def raw(self, request: bytes, half_close=False):
         import socket
         with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=5) as s:
             s.sendall(request)
+            if half_close:                   # nothing more is coming: the server may answer before reading it all
+                s.shutdown(socket.SHUT_WR)
             chunks = []
             while True:                      # the server closes the connection after this error
-                c = s.recv(4096)
+                try:
+                    c = s.recv(4096)
+                except ConnectionResetError:  # a reset after the response leaves what was already received
+                    if not (half_close and chunks):
+                        raise
+                    c = b""
                 if not c:
                     return b"".join(chunks).decode("latin-1")
                 chunks.append(c)
+
+    @staticmethod
+    def parts(resp):
+        head, _, body = resp.partition("\r\n\r\n")
+        lines = head.split("\r\n")
+        headers = {}
+        for line in lines[1:]:
+            name, _, value = line.partition(":")
+            headers.setdefault(name.strip().lower(), []).append(value.strip())
+        return lines[0], headers, body
 
     def test_extension_methods_get_json_405_with_allow(self):
         resp = self.raw(b"PROPFIND /api/notes HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -266,6 +283,66 @@ class ServiceTest(unittest.TestCase):
             self.assertTrue(resp.startswith("HTTP/1.0 400"), resp)
             self.assertIn('"error": "invalid Content-Length"', resp)
         self.assertEqual(self.call("GET", "/api/notes", token=None), (200, []))
+
+    def test_non_plain_note_ids_are_404_on_every_method(self):
+        not_found = json.dumps({"error": "not found"})
+        for note_id in ("abc", "1234567890"):
+            for method in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"):
+                for token in (TOKEN, None):
+                    case = (note_id, method, token is not None)
+                    req = f"{method} /api/notes/{note_id} HTTP/1.1\r\nHost: x\r\n"
+                    if token:
+                        req += f"Authorization: Bearer {token}\r\n"
+                    body = '{"text": "x"}' if method in ("POST", "PUT", "PATCH") else ""
+                    if body:
+                        req += f"Content-Length: {len(body)}\r\n"
+                    status, headers, got = self.parts(self.raw((req + "\r\n" + body).encode(), half_close=True))
+                    self.assertTrue(status.startswith("HTTP/1.0 404 "), (case, status))
+                    self.assertEqual(headers.get("content-type"), ["application/json"], case)
+                    self.assertEqual(headers.get("content-length"), [str(len(not_found))], case)
+                    self.assertEqual(got, "" if method == "HEAD" else not_found, case)
+
+    def test_malformed_requests_get_a_json_error_with_a_status_line(self):
+        too_many = "".join(f"X{i}: a\r\n" for i in range(101))           # the stdlib allows at most 100 headers
+        long_path = "/" + "a" * 65537                                     # over 64 KiB
+        long_header = "X: " + "a" * 65534                                 # one 65 537-byte header line
+        cases = []
+        for method in ("GET", "HEAD"):
+            cases += [
+                (f"{method} {long_path} HTTP/1.1\r\n\r\n", 414, "uri too long"),
+                (f"{method} /health HTTP/1.1\r\n{long_header}", 431, "request header fields too large"),
+                (f"{method} /health HTTP/1.1\r\n{too_many}", 431, "request header fields too large"),
+                (f"{method} /health FOO/1.1\r\n\r\n", 400, "bad request"),
+                (f"{method} /health HTTP/2.0\r\n\r\n", 505, "http version not supported"),
+            ]
+        cases.append(("GET\r\n\r\n", 400, "bad request"))
+        cases.append(("POST /health\r\n\r\n", 400, "bad request"))          # HTTP/0.9 form allows only GET
+        for request, code, message in cases:
+            case = (request[:30], code)
+            resp = self.raw(request.encode("latin-1"), half_close=True)
+            status, headers, body = self.parts(resp)
+            expected = json.dumps({"error": message})
+            self.assertTrue(status.startswith(f"HTTP/1.0 {code} "), (case, status))
+            self.assertEqual(headers.get("content-type"), ["application/json"], case)
+            self.assertEqual(headers.get("connection"), ["close"], case)
+            self.assertEqual(headers.get("content-length"), [str(len(expected))], case)
+            if request.startswith("HEAD"):
+                self.assertEqual(body, "", case)
+            else:
+                self.assertEqual(json.loads(body), {"error": message}, case)
+                self.assertEqual(len(body), len(expected), case)
+            self.assertNotIn("<html", resp.lower(), case)
+
+    def test_204_carries_no_content_length(self):
+        self.call("POST", "/api/notes", {"text": "gone soon"})
+        resp = self.raw(b"DELETE /api/notes/1 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                        + b"\r\n\r\n")
+        status, headers, body = self.parts(resp)
+        self.assertTrue(status.startswith("HTTP/1.0 204 "), status)
+        self.assertNotIn("content-length", headers)
+        self.assertNotIn("content-type", headers)
+        self.assertEqual(body, "")
+        self.assertEqual(self.call("GET", "/api/notes/1", token=None)[0], 404)
 
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
