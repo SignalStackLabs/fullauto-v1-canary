@@ -150,8 +150,10 @@ def make_handler(store, token, version):
             deadline = time.monotonic() + self.timeout            # one deadline for the whole body, not per read
             try:
                 while got < length:
-                    if time.monotonic() > deadline:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
                         raise TimeoutError
+                    self.connection.settimeout(left)              # no single read may outlast the body deadline
                     chunk = self.rfile.read1(length - got)
                     if not chunk:                                 # client closed before sending what it declared
                         return self._send(400, {"error": "request body shorter than Content-Length"})

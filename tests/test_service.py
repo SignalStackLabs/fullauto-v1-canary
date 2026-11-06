@@ -207,6 +207,24 @@ class ServiceTest(unittest.TestCase):
         self.assertTrue(resp.startswith(b"HTTP/1.0 408"), resp)
         self.assertLess(time.monotonic() - t0, 4)
 
+    def test_a_byte_just_before_the_deadline_cannot_extend_it(self):
+        import socket, time
+        self._short_timeout_server(1.0)
+        with socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=10) as s:
+            s.sendall(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                      + b"\r\nContent-Length: 50\r\n\r\n")
+            time.sleep(0.9)
+            t0 = time.monotonic()
+            s.sendall(b" ")                         # arrives ~0.1 s before the body deadline
+            resp = b""
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                resp += c
+        self.assertTrue(resp.startswith(b"HTTP/1.0 408"), resp)
+        self.assertLess(time.monotonic() - t0, 0.8)  # not a further full 1 s read
+
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
             make_server(0, self.tmp.name, "", "v")
