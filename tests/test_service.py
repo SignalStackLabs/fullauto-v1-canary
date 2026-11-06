@@ -257,6 +257,16 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(self.call("POST", "/api/notes", raw=body)[0], 400)
         self.assertEqual(self.call("GET", "/health", token=None)[0], 200)
 
+    def test_duplicate_content_length_headers_are_rejected(self):
+        body = b'{"text": "dup"}'
+        for second in (str(len(body)).encode(), b"5000"):
+            resp = self.raw(b"POST /api/notes HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer " + TOKEN.encode()
+                            + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\nContent-Length: " + second
+                            + b"\r\n\r\n" + body)
+            self.assertTrue(resp.startswith("HTTP/1.0 400"), resp)
+            self.assertIn('"error": "invalid Content-Length"', resp)
+        self.assertEqual(self.call("GET", "/api/notes", token=None), (200, []))
+
     def test_a_token_is_required_to_start(self):
         with self.assertRaises(ValueError):
             make_server(0, self.tmp.name, "", "v")

@@ -167,7 +167,10 @@ def make_handler(store, token, version):
                 return self._send(405, {"error": "method not allowed"})
             if not self._authorized():
                 return self._send(401, {"error": "unauthorized"})
-            raw_length = (self.headers.get("Content-Length") or "0").strip()
+            declared = self.headers.get_all("Content-Length") or []
+            if len(declared) > 1:                                  # ambiguous framing: never pick one
+                return self._send(400, {"error": "invalid Content-Length"})
+            raw_length = (declared[0] if declared else "0").strip()
             if not ASCII_DIGITS.fullmatch(raw_length):
                 return self._send(400, {"error": "invalid Content-Length"})
             significant = raw_length.lstrip("0") or "0"           # zero padding is valid; any length is a number
